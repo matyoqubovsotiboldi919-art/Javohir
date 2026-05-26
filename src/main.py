@@ -54,7 +54,7 @@ MAIN_KB = ReplyKeyboardMarkup(
 )
 
 LINK_RE = re.compile(
-    r"(https?://[^\s<>\"]+|(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:/[^\s<>\"]*)?)",
+    r"((?:https?://)?(?:[\w-]+\.)+[\w-]{2,}(?::\d+)?(?:/[^\s<>\"]*)?)",
     re.IGNORECASE,
 )
 
@@ -230,6 +230,14 @@ async def group_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await analyze_url(url)
         score = int(result["risk_score"])
 
+        logger.info(
+            "GROUP/CHANNEL SCAN | chat=%s | url=%s | score=%s | verdict=%s",
+            chat.id,
+            url,
+            score,
+            result.get("verdict"),
+        )
+
         if score > worst_score:
             worst_score = score
             worst_result = result
@@ -237,7 +245,7 @@ async def group_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not worst_result:
         return
 
-    if worst_result["risk_score"] < 60:
+    if worst_result["risk_score"] < 45:
         return
 
     try:
@@ -250,6 +258,8 @@ async def group_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if message.from_user:
         offender_name = message.from_user.full_name
+    elif chat.type == "channel" and chat.title:
+        offender_name = chat.title
 
     action_text = "Xabar o‘chirildi"
 
