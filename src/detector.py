@@ -4,6 +4,7 @@ import re
 import socket
 from urllib.parse import parse_qs, unquote, urlparse
 
+import cloudscraper
 import httpx
 import tldextract
 
@@ -59,15 +60,6 @@ SENSITIVE_INPUT_WORDS = [
     "pin", "seed", "recovery", "private key", "mnemonic",
 ]
 
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "uz,en-US;q=0.9,en;q=0.8,ru;q=0.7",
-}
-
 
 def extract_urls(text: str) -> list[str]:
     text = text or ""
@@ -75,10 +67,13 @@ def extract_urls(text: str) -> list[str]:
 
     for match in URL_RE.findall(text):
         url = match.strip().rstrip(".,;:!?)\\]}'\"")
+
         if not url:
             continue
+
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
+
         urls.append(url)
 
     return list(dict.fromkeys(urls))
@@ -86,10 +81,12 @@ def extract_urls(text: str) -> list[str]:
 
 def normalize_to_url(text: str) -> str | None:
     text = (text or "").strip()
+
     if not text:
         return None
 
     found = extract_urls(text)
+
     if found:
         return found[0]
 
@@ -127,12 +124,18 @@ def domain_parts(host: str):
 
 def is_known_bad(host: str) -> bool:
     host = (host or "").lower().strip()
-    return host in KNOWN_BAD_DOMAINS or any(host.endswith("." + d) for d in KNOWN_BAD_DOMAINS)
+    return host in KNOWN_BAD_DOMAINS or any(
+        host.endswith("." + d)
+        for d in KNOWN_BAD_DOMAINS
+    )
 
 
 def is_safe_domain(host: str) -> bool:
     host = (host or "").lower().strip()
-    return host in SAFE_DOMAINS or any(host.endswith("." + d) for d in SAFE_DOMAINS)
+    return host in SAFE_DOMAINS or any(
+        host.endswith("." + d)
+        for d in SAFE_DOMAINS
+    )
 
 
 def suspicious_random_domain(domain: str) -> bool:
@@ -158,48 +161,89 @@ async def expand_url(url: str):
     if host in SHORTENER_DOMAINS:
         reasons.append("Short link aniqlandi")
 
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=httpx.Timeout(12.0, connect=8.0),
-        headers=DEFAULT_HEADERS,
-    ) as client:
+    try:
+        scraper = cloudscraper.create_scraper(
+            browser={
+                "browser": "chrome",
+                "platform": "windows",
+                "mobile": False,
+            }
+        )
+
+        resp = scraper.get(
+            url,
+            allow_redirects=True,
+            timeout=15,
+        )
+
+        status_code = resp.status_code
+        final_url = resp.url
+
+        if final_url.rstrip("/") != url.rstrip("/"):
+            redirected = True
+            reasons.append("Redirect mavjud")
+
+        if status_code >= 400:
+            reasons.append(f"Server xatosi qaytardi: HTTP {status_code}")
+
+        return final_url, reasons, redirected, status_code
+
+    except Exception:
         try:
-            resp = await client.get(url)
-            status_code = resp.status_code
-            final_url = str(resp.url)
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=httpx.Timeout(12.0, connect=8.0),
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/136.0.0.0 Safari/537.36"
+                    ),
+                },
+            ) as client:
 
-            if final_url.rstrip("/") != url.rstrip("/"):
-                redirected = True
-                reasons.append("Redirect mavjud")
+                resp = await client.get(url)
 
-            if status_code >= 400:
-                reasons.append(f"Server xatosi qaytardi: HTTP {status_code}")
+                status_code = resp.status_code
+                final_url = str(resp.url)
 
-            return final_url, reasons, redirected, status_code
+                if final_url.rstrip("/") != url.rstrip("/"):
+                    redirected = True
+                    reasons.append("Redirect mavjud")
+
+                if status_code >= 400:
+                    reasons.append(f"Server xatosi qaytardi: HTTP {status_code}")
+
+                return final_url, reasons, redirected, status_code
 
         except Exception:
             if host in SHORTENER_DOMAINS:
                 reasons.append("Short link ochib bo‘lmadi")
             else:
                 reasons.append("Saytga ulanishda muammo bor")
+
             return url, reasons, False, None
 
 
 async def fetch_page(url: str):
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=httpx.Timeout(10.0, connect=6.0),
-            headers=DEFAULT_HEADERS,
-        ) as client:
-            resp = await client.get(url)
-            ctype = (resp.headers.get("content-type") or "").lower()
-            text = ""
+        scraper = cloudscraper.create_scraper(
+            browser={
+                "browser": "chrome",
+                "platform": "windows",
+                "mobile": False,
+            }
+        )
 
-            if "text/html" in ctype or "text/plain" in ctype or not ctype:
-                text = resp.text[:120000]
+        resp = scraper.get(url, timeout=15)
 
-            return text, resp.status_code
+        ctype = (resp.headers.get("content-type") or "").lower()
+        text = ""
+
+        if "text/html" in ctype or "text/plain" in ctype or not ctype:
+            text = resp.text[:120000]
+
+        return text, resp.status_code
 
     except Exception:
         return "", None
@@ -248,11 +292,14 @@ async def analyze_url(text: str):
     def add(points: int, reason: str):
         nonlocal risk
         risk += points
+
         if reason not in reasons:
             reasons.append(reason)
 
     ext, domain, suffix, registered_domain = domain_parts(host)
+
     tld = (suffix or "").split(".")[-1].lower()
+
     is_short = host in SHORTENER_DOMAINS
 
     for r in expand_reasons:
@@ -260,21 +307,22 @@ async def analyze_url(text: str):
             reasons.append(r)
 
     if is_short:
-        add(35, "Short link")
+        add(20, "Short link")
 
     if redirected:
-        add(25, "Link boshqa manzilga redirect qilmoqda")
+        add(15, "Redirect mavjud")
 
     if expand_status and expand_status >= 400:
-        add(25, f"Server xatosi: HTTP {expand_status}")
+        add(10, f"Server xatosi: HTTP {expand_status}")
 
     if is_short and expand_status and expand_status >= 400:
-        add(35, "Short link ochilmadi, yashirin manzil bo‘lishi mumkin")
+        add(15, "Short link server tomonidan bloklandi")
 
     if parsed.scheme != "https":
         add(15, "HTTPS ishlatilmagan")
 
     dns_ok = True
+
     if host:
         dns_ok = await dns_resolves(host)
 
@@ -283,82 +331,96 @@ async def analyze_url(text: str):
 
     try:
         ipaddress.ip_address(host)
-        add(35, "Domen o‘rniga IP manzil ishlatilgan")
+        add(35, "Domen o‘rniga IP ishlatilgan")
     except Exception:
         pass
 
     if "xn--" in host:
-        add(25, "Punycode domen aniqlangan")
+        add(25, "Punycode domen")
 
     if tld in SUSPICIOUS_TLDS:
         add(25, f"Shubhali TLD: .{tld}")
 
     if suspicious_random_domain(domain):
-        add(16, "Domen nomi tasodifiy/yashirin ko‘rinishda")
+        add(16, "Tasodifiy domen")
 
     if len(final_url) > 120:
         add(10, "URL juda uzun")
 
     if host.count(".") >= 4:
-        add(16, "Subdomainlar juda ko‘p")
-
-    if host.count("-") >= 3:
-        add(12, "Domen ichida tire juda ko‘p")
+        add(16, "Subdomain juda ko‘p")
 
     if "@" in final_url:
-        add(30, "URL ichida '@' belgisi bor")
+        add(30, "URL ichida @ belgisi bor")
 
-    if any(k in path_qs for k in ["redirect=", "url=", "next=", "target=", "dest=", "return=", "continue="]):
+    if any(k in path_qs for k in [
+        "redirect=", "url=", "next=", "target="
+    ]):
         add(18, "Redirect parametrlari bor")
 
-    if any(k in path_qs for k in ["web-mail", "webmail", "free.fr", "s-host", "cpanel", "roundcube"]):
-        add(35, "Webmail/login sahifasiga o‘xshash yo‘l aniqlangan")
-
     url_hits = [w for w in PHISH_WORDS if w in full_url]
-    if url_hits:
-        add(28, "URL ichida phishing kalit so‘zlar bor")
+
+    if len(url_hits) >= 3:
+        add(25, "URL ichida phishing so‘zlari bor")
 
     qs = parse_qs(parsed.query)
+
     if len(qs) >= 6:
-        add(12, "So‘rov parametrlari juda ko‘p")
+        add(12, "Query param juda ko‘p")
 
     page_text, page_status = await fetch_page(final_url)
 
     if page_status and page_status >= 400:
-        add(10, f"Sahifa HTTP {page_status} qaytardi")
+        add(10, f"Sahifa HTTP {page_status}")
 
     if page_text:
         lower_page = page_text.lower()
 
         page_hits = [w for w in PHISH_WORDS if w in lower_page]
+
         if len(page_hits) >= 6:
-            add(20, "Sahifa ichida phishingga xos so‘zlar topildi")
+            add(20, "Phishingga o‘xshash matn")
 
         has_form = "<form" in lower_page
-        has_password_input = 'type="password"' in lower_page or "type='password'" in lower_page
-        sensitive_count = sum(1 for w in SENSITIVE_INPUT_WORDS if w in lower_page)
+
+        has_password_input = (
+            'type="password"' in lower_page
+            or "type='password'" in lower_page
+        )
+
+        sensitive_count = sum(
+            1 for w in SENSITIVE_INPUT_WORDS
+            if w in lower_page
+        )
 
         if has_form and has_password_input and sensitive_count >= 2:
-            add(45, "Sahifa parol kiritish formasiga ega")
+            add(45, "Parol formasi mavjud")
 
         elif (
             has_form
             and sensitive_count >= 4
-            and any(x in lower_page for x in ["verify", "otp", "login", "wallet", "bank", "confirm"])
+            and any(x in lower_page for x in [
+                "verify", "otp", "login",
+                "wallet", "bank", "confirm"
+            ])
         ):
-            add(35, "Sahifa maxfiy ma’lumot so‘rayotganga o‘xshaydi")
+            add(35, "Maxfiy ma’lumot so‘rashi mumkin")
 
-        if "metamask" in lower_page or "seed phrase" in lower_page or "recovery phrase" in lower_page:
-            add(45, "Kripto wallet seed/recovery ma’lumotlarini so‘rash ehtimoli bor")
+        if (
+            "metamask" in lower_page
+            or "seed phrase" in lower_page
+            or "recovery phrase" in lower_page
+        ):
+            add(45, "Kripto wallet ma’lumotlari so‘ralmoqda")
 
     if host and not dns_ok:
         risk = max(risk, 70)
 
     if is_short and redirected:
-        risk = max(risk, 50)
+        risk = max(risk, 35)
 
     if is_short and expand_status and expand_status >= 400:
-        risk = max(risk, 75)
+        risk = max(risk, 40)
 
     risk = max(0, min(100, risk))
 
@@ -401,14 +463,19 @@ def format_result_message(result: dict) -> str:
     if result["verdict"] == "safe":
         status_line = "🟢 *Xavfsizroq*"
         detection = "0 / 10"
+
     elif result["verdict"] == "suspicious":
         status_line = "🟡 *Shubhali*"
         detection = "5 / 10"
+
     else:
         status_line = "🔴 *Xavfli*"
         detection = "9 / 10"
 
-    reasons_text = "\n".join(f"• {safe_md(r)}" for r in result["reasons"])
+    reasons_text = "\n".join(
+        f"• {safe_md(r)}"
+        for r in result["reasons"]
+    )
 
     return (
         "🔍 *Havola tekshiruvi*\n\n"
@@ -419,5 +486,6 @@ def format_result_message(result: dict) -> str:
         f"⚠️ *Holat:* {status_line}\n\n"
         f"🧠 *Aniqlangan sabablar:*\n{reasons_text}\n\n"
         "📌 *Tavsiya:*\n"
-        "Havola shubhali bo‘lsa uni ochmang, parol, karta ma'lumoti yoki OTP kiritmang."
+        "Havola shubhali bo‘lsa uni ochmang, "
+        "parol, karta ma'lumoti yoki OTP kiritmang."
     )
